@@ -59,13 +59,16 @@ Eliminate the input pipe (`PFIN` / `PFOUT`) entirely by writing the log data to 
 
 1. **Add `use File::Temp qw(tempfile)`** — the only new `use` statement.
 2. **Remove `pipe(PFIN, PFOUT)`** and the three lines that redirected STDIN to PFIN (`fileno`, `close(STDIN)`, `open(STDIN, "<&=$fhin")`).
-3. **Add `my ($tmpfh, $tmpfile) = tempfile(UNLINK => 1)`** in their place. `UNLINK => 1` ensures automatic cleanup on exit.
-4. **Parent block**: replace all `print PFOUT $line` with `print $tmpfh $line`; replace `close(PFOUT)` with `close($tmpfh)`.
-5. **Child block**: remove `close(PFOUT)`; replace the old STDIN dup with `open(STDIN, "<", $tmpfile)`.
+3. **Add `my ($tmpfh, $tmpfile) = tempfile("zmdailyreport.XXXXXX", DIR => "/tmp", UNLINK => 0)`** in their place. `UNLINK => 0` disables auto-cleanup so the file is explicitly removed after use.
+4. **Move all log writing before the fork** — the parent writes log lines to the tempfile and closes it before calling `fork()`, ensuring `pflogsumm.pl` always reads a complete dataset with no race condition.
+5. **Parent block**: replace all `print PFOUT $line` with `print $tmpfh $line`; replace `close(PFOUT)` with `close($tmpfh)`. After draining `MIN`, call `unlink $tmpfile` to clean up.
+6. **Child block**: remove `close(PFOUT)`; replace the old STDIN dup with `open(STDIN, "<", $tmpfile)`; add `exit 0` after `close(STDOUT)`.
 
 ---
 
 ## Updated Script
+
+See `zmdailyreport-updated_v2` in this repository.
 
 ```perl
 #!/usr/bin/perl
@@ -84,7 +87,8 @@ Eliminate the input pipe (`PFIN` / `PFOUT`) entirely by writing the log data to 
 # You should have received a copy of the GNU General Public License along with this program.
 # If not, see <https://www.gnu.org/licenses/>.
 # ***** END LICENSE BLOCK *****
-
+# Modified 23 April 2026 by Mission Critical Email LLC  to support very long Daily Mail Reports
+# and prevent such reports from otherwise getting truncated.
 =head1 NAME
 
 zmdailyreport - report on email usage
@@ -121,62 +125,75 @@ pod2usage( -exitval => 1, -verbose => 0 ) if ( $Opt{help} );
 $Debug = $Opt{debug};
 
 setlocale(LC_TIME, "C");
+
 my $stdout;
 open($stdout, ">&STDOUT") || die $!;
-pipe(MIN, MOUT);
-my ($tmpfh, $tmpfile) = tempfile(UNLINK => 1);
 
+my ($tmpfh, $tmpfile) = tempfile(
+    "zmdailyreport.XXXXXX",
+    DIR    => "/tmp",
+    UNLINK => 0
+);
+
+my $today = strftime("%b %e ", localtime);
+my $datestring = strftime("%F", localtime);
+my $ymd = strftime("%Y%m%d", localtime);
+
+my $found = 0;
+my $old_log;
+
+if (-f "/var/log/zimbra.log.1.gz") {
+    $old_log = "gzip -dc /var/log/zimbra.log.1.gz |";
+} elsif (-f "/var/log/zimbra.log-$ymd.gz") {
+    $old_log = "gzip -dc /var/log/zimbra.log-$ymd.gz |";
+} elsif (-f "/var/log/zimbra.log.1.bz2") {
+    $old_log = "bzip2 -dc /var/log/zimbra.log.1.bz2 |";
+} elsif (-f "/var/log/zimbra.log-$ymd.bz2") {
+    $old_log = "bzip2 -dc /var/log/zimbra.log-$ymd.bz2 |";
+}
+
+if (defined($old_log)) {
+    if (open(LOG, $old_log)) {
+        while (<LOG>) {
+            my $line = $_;
+            if ($line =~ /$today/o) {
+                print $tmpfh $line;
+                $found = 1;
+            } elsif ($found) {
+                last; # don't scan any further, we've exhausted today's logs
+            }
+        }
+        close(LOG);
+    }
+}
+
+open(LOG, "</var/log/zimbra.log") || die $!;
+$found = 0;
+while (<LOG>) {
+    my $line = $_;
+    if ($line =~ /$today/o) {
+        print $tmpfh $line;
+        $found = 1;
+    } elsif ($found) {
+        last; # don't scan any further, we've exhausted today's logs
+    }
+}
+close(LOG);
+
+close($tmpfh) || die "Could not close temp file $tmpfile: $!";
+
+pipe(MIN, MOUT) || die $!;
 
 if (fork()) {
     close(MOUT);
-    my $today = strftime("%b %e ", localtime);
-    my $datestring = strftime("%F", localtime);
-    my $ymd = strftime("%Y%m%d", localtime);
-
-    my $found = 0;
-    my $old_log;
-    if (-f "/var/log/zimbra.log.1.gz") {
-        $old_log = "gzip -dc /var/log/zimbra.log.1.gz |";
-    } elsif (-f "/var/log/zimbra.log-$ymd.gz") {
-        $old_log = "gzip -dc /var/log/zimbra.log-$ymd.gz |";
-    } elsif (-f "/var/log/zimbra.log.1.bz2") {
-        $old_log = "bzip2 -dc /var/log/zimbra.log.1.bz2 |";
-    } elsif (-f "/var/log/zimbra.log-$ymd.bz2") {
-        $old_log = "bzip2 -dc /var/log/zimbra.log-$ymd.bz2 |";
-    }
-    if (defined($old_log)) {
-        if (open(LOG, $old_log)) {
-            while (<LOG>) {
-                my $line = $_;
-                if ($line =~ /$today/o) {
-                    print $tmpfh $line;
-                    $found = 1;
-                } elsif ($found) {
-                    last; # don't scan any further, we've exhausted today's logs
-                }
-            }
-            close(LOG);
-        }
-    }
-    open(LOG, "</var/log/zimbra.log") || die $!;
-    $found = 0;
-    while (<LOG>) {
-        my $line = $_;
-        if ($line =~ /$today/o) {
-            print $tmpfh $line;
-            $found = 1;
-        } elsif ($found) {
-            last; # don't scan any further, we've exhausted today's logs
-        }
-    }
-    close(LOG);
-    close($tmpfh);
 
     my @Report;
     while (<MIN>) {
         push(@Report, $_);
     }
-    close (MIN);
+    close(MIN);
+
+    unlink $tmpfile;
 
     if ($Opt{mailreport}) {
         sendEmailReport(day => $datestring, data => \@Report);
@@ -185,15 +202,21 @@ if (fork()) {
     }
 } else {
     close(MIN);
-    open(STDIN, "<", $tmpfile) || die $!;
+
+    open(STDIN, "<", $tmpfile) || die "Could not open temp file $tmpfile: $!";
     open(STDOUT, ">&MOUT") || die $!;
+
     my $user_limit = getLocalConfig('zimbra_mtareport_max_users') || 50;
     my $host_limit = getLocalConfig('zimbra_mtareport_max_hosts') || 50;
+
     $user_limit = 50 if $user_limit !~ /^\d+/;
     $host_limit = 50 if $host_limit !~ /^\d+/;
+
     @ARGV = ('-u', $user_limit, '-h', $host_limit);
     do '/opt/zimbra/common/bin/pflogsumm.pl';
+
     close(STDOUT);
+    exit 0;
 }
 
 {    # avoid making $LocalConfig global
@@ -242,7 +265,7 @@ sub getLdapServerConfigValue {
 
     return (undef) unless ($attrib);
     my $server = getLocalConfig("zimbra_server_hostname");
-    # could consider redirecting STDERR to /dev/null
+
     open( CONF, "/opt/zimbra/bin/zmprov -l gs $server '$attrib' |" )
       or die("Open global config failed: $!");
 
@@ -251,7 +274,6 @@ sub getLdapServerConfigValue {
         chomp;
         next if (/^#/);
         ( $key, $val ) = split( /:\s*/, $_, 2 );
-        # for now just assume a single value/attribute is requested
         last if ($val);
     }
     return $val;
@@ -262,7 +284,6 @@ sub getLdapGlobalConfigValue {
 
     return (undef) unless ($attrib);
 
-    # could consider redirecting STDERR to /dev/null
     open( CONF, "/opt/zimbra/bin/zmprov -l gcf '$attrib' |" )
       or die("Open global config failed: $!");
 
@@ -270,7 +291,6 @@ sub getLdapGlobalConfigValue {
     while (<CONF>) {
         chomp;
         ( $key, $val ) = split( /:\s*/, $_, 2 );
-        # for now just assume a single value/attribute is requested
         last if ($val);
     }
     return $val;
@@ -279,18 +299,20 @@ sub getLdapGlobalConfigValue {
 sub sendEmailReport {
     my %arg = @_;
 
-    my $data = $arg{data};    # @Report data for message body
+    my $data = $arg{data};
 
     my $subject      = "Daily mail report for $arg{day}";
     my $from_address = getLocalConfig("smtp_source");
     my $to_address;
+
     if ($Opt{user}) {
       $to_address = $Opt{user};
     } else {
-      $to_address   = getLocalConfig("smtp_destination");
+      $to_address = getLocalConfig("smtp_destination");
     }
-    my $smtphost     = getLdapConfigValue("zimbraSmtpHostname") || "localhost";
-    my $smtpport     = getLdapConfigValue("zimbraSmtpPort") || 25;
+
+    my $smtphost = getLdapConfigValue("zimbraSmtpHostname") || "localhost";
+    my $smtpport = getLdapConfigValue("zimbraSmtpPort") || 25;
 
     warn("DEBUG: Sending daily report to $to_address via $smtphost\n")
       if ($Debug);
@@ -308,17 +330,17 @@ sub sendEmailReport {
         print $mailer @$data;
         $mailer->close();
     };
+
     if ($@) {
         logError("Failed to email report using SMTP via '$smtphost': $@\n");
-    }
-    else {
+    } else {
         warn("DEBUG: Email report sent to $to_address\n") if ($Debug);
     }
 }
 
 sub logError {
-  my $msg = shift;
-  print STDERR $msg;
-  return;
+    my $msg = shift;
+    print STDERR $msg;
+    return;
 }
 ```
