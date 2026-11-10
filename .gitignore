@@ -1,0 +1,2 @@
+# Claude Code local settings: "do not ask again" rules record whole commands. Never commit.
+.claude/settings.local.json
